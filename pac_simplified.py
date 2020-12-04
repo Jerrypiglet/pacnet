@@ -6,8 +6,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-__all__ = ['PacConv2d', 'PacConvTranspose2d', 'PacPool2d',
-           'pacconv2d', 'pacconv_transpose2d', 'pacpool2d', 'packernel2d', 'nd2col']
+__all__ = ['PacConv2d', 'PacPool2d',
+           'pacconv2d', 'pacpool2d', 'packernel2d', 'nd2col']
 
 import math
 from numbers import Number
@@ -20,6 +20,9 @@ import torch.nn.functional as F
 from torch.autograd.function import Function, once_differentiable
 from torch.nn.parameter import Parameter
 from torch.nn.modules.utils import _pair
+from deform_conv_func import DeformIm2colFunction, DeformConvFunction
+
+import DCN
 
 try:
     import pyinn as P
@@ -50,7 +53,7 @@ def np_gaussian_2d(width, sigma=-1):
 
 
 def nd2col(input_nd, kernel_size, stride=1, padding=0, output_padding=0, dilation=1, transposed=False,
-           use_pyinn_if_possible=False):
+           use_pyinn_if_possible=False, offsets=None):
     """
     Shape:
         - Input: :math:`(N, C, L_{in})`
@@ -81,7 +84,17 @@ def nd2col(input_nd, kernel_size, stride=1, padding=0, output_padding=0, dilatio
     if n_dims == 2 and dilation == 1 and has_pyinn and torch.cuda.is_available() and use_pyinn_if_possible:
         output = P.im2col(input_nd, kernel_size, stride, padding)
     else:
-        output = F.unfold(input_nd, kernel_size, dilation, padding, stride)
+        if offsets is None:
+            output = F.unfold(input_nd, kernel_size, dilation, padding, stride)
+        else:
+            if not input_nd.is_contiguous():
+                input_nd = input_nd.contiguous()
+            output = DeformIm2colFunction.apply(input_nd, offsets, 
+                                                kernel_size, 
+                                                stride, 
+                                                padding, 
+                                                dilation)
+            print('Using DeformIm2colFunction in nd2col!')
         out_shape = (bs, nch) + tuple(kernel_size) + out_sz
         output = output.view(*out_shape).contiguous()
     return output
@@ -201,93 +214,10 @@ class PacConv2dFn(Function):
 
         return grad_input, grad_kernel, grad_weight, grad_bias, None, None, None, None
 
-
-class PacConvTranspose2dFn(Function):
-    @staticmethod
-    def forward(ctx, input, kernel, weight, bias=None, stride=1, padding=0, output_padding=0, dilation=1,
-                shared_filters=False):
-        (bs, ch), in_sz = input.shape[:2], input.shape[2:]
-        if kernel.size(1) > 1:
-            raise ValueError('Non-singleton channel is not allowed for kernel.')
-        ctx.in_ch = ch
-        ctx.kernel_size = tuple(weight.shape[-2:])
-        ctx.dilation = _pair(dilation)
-        ctx.padding = _pair(padding)
-        ctx.output_padding = _pair(output_padding)
-        ctx.stride = _pair(stride)
-        ctx.shared_filters = shared_filters
-        ctx.save_for_backward(input if (ctx.needs_input_grad[1] or ctx.needs_input_grad[2]) else None,
-                              kernel if (ctx.needs_input_grad[0] or ctx.needs_input_grad[2]) else None,
-                              weight if (ctx.needs_input_grad[0] or ctx.needs_input_grad[1]) else None)
-
-        w = input.new_ones((ch, 1, 1, 1))
-        x = F.conv_transpose2d(input, w, stride=stride, groups=ch)
-        pad = [(k - 1) * d - p for (k, d, p) in zip(ctx.kernel_size, ctx.dilation, ctx.padding)]
-        x = F.pad(x, (pad[1], pad[1] + ctx.output_padding[1], pad[0], pad[0] + ctx.output_padding[0]))
-
-        cols = F.unfold(x, ctx.kernel_size, ctx.dilation, _pair(0), _pair(1))
-
-        in_mul_k = cols.view(bs, ch, *kernel.shape[2:]) * kernel
-
-        # matrix multiplication, written as an einsum to avoid repeated view() and permute()
-        if shared_filters:
-            output = torch.einsum('ijklmn,jokl->iomn', (in_mul_k, weight))
-        else:
-            output = torch.einsum('ijklmn,jokl->iomn', (in_mul_k, weight))
-
-        if bias is not None:
-            output += bias.view(1, -1, 1, 1)
-
-        return output.clone()  # TODO understand why a .clone() is needed here
-
-    @staticmethod
-    @once_differentiable
-    def backward(ctx, grad_output):
-        grad_input = grad_kernel = grad_weight = grad_bias = None
-        (bs, out_ch), out_sz = grad_output.shape[:2], grad_output.shape[2:]
-        in_ch = ctx.in_ch
-        pad = [(k - 1) * d - p for (k, d, p) in zip(ctx.kernel_size, ctx.dilation, ctx.padding)]
-        pad = [(p, p + op) for (p, op) in zip(pad, ctx.output_padding)]
-
-        input, kernel, weight = ctx.saved_tensors
-        if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
-            if ctx.shared_filters:
-                grad_in_mul_k = grad_output.view(bs, out_ch, 1, 1, out_sz[0], out_sz[1]) \
-                                * weight.view(ctx.kernel_size[0], ctx.kernel_size[1], 1, 1)
-            else:
-                grad_in_mul_k = torch.einsum('iomn,jokl->ijklmn', (grad_output, weight))
-        if ctx.needs_input_grad[1] or ctx.needs_input_grad[2]:
-            w = input.new_ones((in_ch, 1, 1, 1))
-            x = F.conv_transpose2d(input, w, stride=ctx.stride, groups=in_ch)
-            x = F.pad(x, (pad[1][0], pad[1][1], pad[0][0], pad[0][1]))
-            in_cols = F.unfold(x, ctx.kernel_size, ctx.dilation, _pair(0), _pair(1))
-            in_cols = in_cols.view(bs, in_ch, ctx.kernel_size[0], ctx.kernel_size[1], out_sz[0], out_sz[1])
-        if ctx.needs_input_grad[0]:
-            grad_im2col_output = grad_in_mul_k * kernel
-            grad_im2col_output = grad_im2col_output.view(bs, -1, out_sz[0] * out_sz[1])
-            im2col_input_sz = [o + (k - 1) * d for (o, k, d) in zip(out_sz, ctx.kernel_size, ctx.dilation)]
-
-            grad_input = F.fold(grad_im2col_output,
-                                im2col_input_sz[:2], ctx.kernel_size, ctx.dilation, 0, 1)
-            grad_input = grad_input[:, :, pad[0][0]:-pad[0][1]:ctx.stride[0], pad[1][0]:-pad[1][1]:ctx.stride[1]]
-        if ctx.needs_input_grad[1]:
-            grad_kernel = in_cols * grad_in_mul_k
-            grad_kernel = grad_kernel.sum(dim=1, keepdim=True)
-        if ctx.needs_input_grad[2]:
-            in_mul_k = in_cols * kernel
-            if ctx.shared_filters:
-                grad_weight = torch.einsum('ijmn,ijklmn->kl', (grad_output, in_mul_k))
-                grad_weight = grad_weight.view(1, 1, ctx.kernel_size[0], ctx.kernel_size[1]).contiguous()
-            else:
-                grad_weight = torch.einsum('iomn,ijklmn->jokl', (grad_output, in_mul_k))
-        if ctx.needs_input_grad[3]:
-            grad_bias = torch.einsum('iomn->o', (grad_output,))
-        return grad_input, grad_kernel, grad_weight, grad_bias, None, None, None, None, None
-
-
 class PacPool2dFn(Function):
     @staticmethod
-    def forward(ctx, input, kernel, kernel_size, stride=1, padding=0, dilation=1):
+    def forward(ctx, input, kernel, kernel_size, stride=1, padding=0, dilation=1, offsets=None):
+        # print('=======>')
         (bs, ch), in_sz = input.shape[:2], input.shape[2:]
         if kernel.size(1) > 1 and kernel.size(1) != ch:
             raise ValueError('Incompatible input and kernel sizes.')
@@ -297,11 +227,31 @@ class PacPool2dFn(Function):
         ctx.dilation = _pair(dilation)
         ctx.padding = _pair(padding)
         ctx.stride = _pair(stride)
-        ctx.save_for_backward(input if ctx.needs_input_grad[1] else None,
-                              kernel if ctx.needs_input_grad[0] else None)
-        # ctx.save_for_backward(input, kernel)
+        ctx.save_for_backward(input if ctx.needs_input_grad[0] or ctx.needs_input_grad[1] or ctx.needs_input_grad[6] else None,
+                              kernel if ctx.needs_input_grad[0] or ctx.needs_input_grad[6] else None, 
+                              offsets if ctx.needs_input_grad[0] or ctx.needs_input_grad[6] else None)
+        print(ctx.needs_input_grad)
+        # print('input', input, input.shape)
+        # print('kernel', kernel, kernel.shape)
+        # print('offsets', offsets, offsets.shape)
 
-        cols = F.unfold(input, ctx.kernel_size, ctx.dilation, ctx.padding, ctx.stride)
+        if offsets is None:
+            cols = F.unfold(input, ctx.kernel_size, ctx.dilation, ctx.padding, ctx.stride)
+        else:
+            # cols = DeformIm2colFunction.apply(input.contiguous(), offsets, 
+            #                         ctx.kernel_size, 
+            #                         ctx.stride, 
+            #                         ctx.padding, 
+            #                         ctx.dilation)
+            cols = DCN.deform_im2col_forward(input.contiguous(), 
+                                    offsets,
+                                    ctx.kernel_size[0], ctx.kernel_size[1],
+                                    ctx.stride[0], ctx.stride[1],
+                                    ctx.padding[0], ctx.padding[1],
+                                    ctx.dilation[0], ctx.dilation[1],
+                                    1, 1, 1,)
+        print('----cols', cols.shape)
+
 
         output = cols.view(bs, ch, *kernel.shape[2:]) * kernel
         output = torch.einsum('ijklmn->ijmn', (output,))
@@ -311,28 +261,57 @@ class PacPool2dFn(Function):
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_output):
-        input, kernel = ctx.saved_tensors
-        grad_input = grad_kernel = None
+        # print('<=======', ctx.needs_input_grad, ctx.needs_input_grad[0] or ctx.needs_input_grad[6])
+        input, kernel, offsets = ctx.saved_tensors
+        # print('input', input)
+        # print('kernel', kernel)
+        # print('offsets', offsets)
+        grad_input = grad_kernel = grad_offset = None
         (bs, ch), out_sz = grad_output.shape[:2], grad_output.shape[2:]
-        if ctx.needs_input_grad[0]:
-            grad_im2col_output = torch.einsum('ijmn,izklmn->ijklmn', (grad_output, kernel))
-            grad_im2col_output = grad_im2col_output.view(bs, -1, out_sz[0] * out_sz[1])
+        if ctx.needs_input_grad[0] or ctx.needs_input_grad[6]:
+            if offsets is None:
+                grad_im2col_output = torch.einsum('ijmn,izklmn->ijklmn', (grad_output, kernel))
+                grad_im2col_output = grad_im2col_output.view(bs, -1, out_sz[0] * out_sz[1])
 
-            grad_input = F.fold(grad_im2col_output,
-                                ctx.input_size[:2], ctx.kernel_size, ctx.dilation, ctx.padding, ctx.stride)
+                grad_input = F.fold(grad_im2col_output,
+                                    ctx.input_size[:2], ctx.kernel_size, ctx.dilation, ctx.padding, ctx.stride)
+            else:
+                # print('----a')
+                # print(kernel.shape)
+                # print(grad_output.shape)
+                grad_im2col_output = torch.einsum('ijmn,izklmn->ijklmn', (grad_output, kernel))
+                # print('----a1', grad_im2col_output.shape)
+                grad_im2col_output = grad_im2col_output.view(bs, -1, out_sz[0] * out_sz[1])
+                # assert grad_im2col_output.shape == grad_im2col_output.shape
+                # print('----b', grad_im2col_output.shape)
+                grad_input, grad_offset = \
+                    DCN.deform_im2col_backward(input.contiguous(), 
+                                            offsets,
+                                            grad_im2col_output,
+                                            ctx.kernel_size[0], ctx.kernel_size[1],
+                                            ctx.stride[0], ctx.stride[1],
+                                            ctx.padding[0], ctx.padding[1],
+                                            ctx.dilation[0], ctx.dilation[1],
+                                            1, 1, 1)
+                # grad_input = F.fold(grad_im2col_output,
+                #                     ctx.input_size[:2], ctx.kernel_size, ctx.dilation, ctx.padding, ctx.stride)
+                # print('---standard grad_input')
+
+
         if ctx.needs_input_grad[1]:
             cols = F.unfold(input, ctx.kernel_size, ctx.dilation, ctx.padding, ctx.stride)
             cols = cols.view(bs, ch, ctx.kernel_size[0], ctx.kernel_size[1], out_sz[0], out_sz[1])
             grad_kernel = torch.einsum('ijmn,ijklmn->ijklmn', (grad_output, cols))
             if ctx.kernel_ch == 1:
                 grad_kernel = grad_kernel.sum(dim=1, keepdim=True)
+        # if ctx.needs_input_grad[6]:
 
-        return grad_input, grad_kernel, None, None, None, None
+        return grad_input, grad_kernel, None, None, None, None, grad_offset
 
 
 def packernel2d(input, mask=None, kernel_size=0, stride=1, padding=0, output_padding=0, dilation=1,
                 kernel_type='gaussian', smooth_kernel_type='none', smooth_kernel=None, inv_alpha=None, inv_lambda=None,
-                channel_wise=False, normalize_kernel=False, transposed=False, native_impl=False):
+                channel_wise=False, normalize_kernel=False, transposed=False, native_impl=False, offsets=None):
     kernel_size = _pair(kernel_size)
     dilation = _pair(dilation)
     padding = _pair(padding)
@@ -348,20 +327,21 @@ def packernel2d(input, mask=None, kernel_size=0, stride=1, padding=0, output_pad
         in_sz = tuple(int((o - op - 1 - (k - 1) * d + 2 * p) // s) + 1 for (o, k, s, p, op, d) in
                       zip(input.shape[-2:], kernel_size, stride, padding, output_padding, dilation))
     else:
-        in_sz = input.shape[-2:]
+        in_sz = input.shape[-2:] # [h, w]
 
     if mask is not None or normalize_kernel:
-        mask_pattern = input.new_ones(1, 1, *in_sz)
+        mask_pattern = input.new_ones(1, 1, *in_sz) # [1, 1, h, w], all ones
         mask_pattern = nd2col(mask_pattern, kernel_size, stride=stride, padding=padding, output_padding=output_padding,
-                              dilation=dilation, transposed=transposed)
+                              dilation=dilation, transposed=transposed, offsets=offsets)
         if mask is not None:
             mask = nd2col(mask, kernel_size, stride=stride, padding=padding, output_padding=output_padding,
-                          dilation=dilation, transposed=transposed)
+                          dilation=dilation, transposed=transposed, offsets=offsets)
             if not normalize_kernel:
                 norm = mask.sum(dim=2, keepdim=True).sum(dim=3, keepdim=True) \
                        / mask_pattern.sum(dim=2, keepdim=True).sum(dim=3, keepdim=True)
         else:
             mask = mask_pattern
+        # print('-------', mask.shape, mask) # torch.Size([1, 1, 7, 7, 240, 320]), ones and zeros
 
     if transposed:
         stride = _pair(1)
@@ -426,7 +406,8 @@ def packernel2d(input, mask=None, kernel_size=0, stride=1, padding=0, output_pad
 
 
 def pacconv2d(input, kernel, weight, bias=None, stride=1, padding=0, dilation=1, shared_filters=False,
-              native_impl=False):
+              native_impl=False, 
+              offsets=None):
     kernel_size = tuple(weight.shape[-2:])
     stride = _pair(stride)
     padding = _pair(padding)
@@ -434,7 +415,9 @@ def pacconv2d(input, kernel, weight, bias=None, stride=1, padding=0, dilation=1,
 
     if native_impl:
         # im2col on input
-        im_cols = nd2col(input, kernel_size, stride=stride, padding=padding, dilation=dilation)
+        im_cols = nd2col(input, kernel_size, stride=stride, padding=padding, dilation=dilation, offsets=offsets)
+        if offsets is not None:
+            print('Using DeformIm2colFunction in pacconv2d (native_impl)!')
 
         # main computation
         if shared_filters:
@@ -450,34 +433,13 @@ def pacconv2d(input, kernel, weight, bias=None, stride=1, padding=0, dilation=1,
     return output
 
 
-def pacconv_transpose2d(input, kernel, weight, bias=None, stride=1, padding=0, output_padding=0, dilation=1,
-                        shared_filters=False, native_impl=False):
-    kernel_size = tuple(weight.shape[-2:])
-    stride = _pair(stride)
-    padding = _pair(padding)
-    output_padding = _pair(output_padding)
-    dilation = _pair(dilation)
-
-    if native_impl:
-        ch = input.shape[1]
-        w = input.new_ones((ch, 1, 1, 1))
-        x = F.conv_transpose2d(input, w, stride=stride, groups=ch)
-        pad = [(kernel_size[i] - 1) * dilation[i] - padding[i] for i in range(2)]
-        x = F.pad(x, (pad[1], pad[1] + output_padding[1], pad[0], pad[0] + output_padding[0]))
-        output = pacconv2d(x, kernel, weight.permute(1, 0, 2, 3), bias, dilation=dilation,
-                           shared_filters=shared_filters, native_impl=True)
-    else:
-        output = PacConvTranspose2dFn.apply(input, kernel, weight, bias, stride, padding, output_padding, dilation,
-                                            shared_filters)
-
-    return output
-
-
-def pacpool2d(input, kernel, kernel_size, stride=1, padding=0, dilation=1, native_impl=False):
+def pacpool2d(input, kernel, kernel_size, stride=1, padding=0, dilation=1, native_impl=False, offsets=None):
     kernel_size = _pair(kernel_size)
     stride = _pair(stride)
     padding = _pair(padding)
     dilation = _pair(dilation)
+
+    # native_impl=True
 
     if native_impl:
         bs, in_ch, in_h, in_w = input.shape
@@ -485,13 +447,18 @@ def pacpool2d(input, kernel, kernel_size, stride=1, padding=0, dilation=1, nativ
         out_w = (in_w + 2 * padding[1] - dilation[1] * (kernel_size[1] - 1) - 1) // stride[1] + 1
 
         # im2col on input
-        im_cols = nd2col(input, kernel_size, stride=stride, padding=padding, dilation=dilation)
+        im_cols = nd2col(input, kernel_size, stride=stride, padding=padding, dilation=dilation, offsets=offsets)
+        if offsets is not None:
+            print('Using DeformIm2colFunction in pacpool2d (native_impl)!')
 
         # main computation
+        # print(input.shape, im_cols.shape, kernel.shape) # torch.Size([1, 3, 240, 320]) torch.Size([1, 3, 7, 7, 240, 320]) torch.Size([1, 1, 7, 7, 240, 320])
         im_cols *= kernel
         output = im_cols.view(bs, in_ch, -1, out_h, out_w).sum(dim=2, keepdim=False)
     else:
-        output = PacPool2dFn.apply(input, kernel, kernel_size, stride, padding, dilation)
+        output = PacPool2dFn.apply(input, kernel, kernel_size, stride, padding, dilation, offsets)
+        if offsets is not None:
+            print('Using DeformIm2colFunction in pacpool2d (NOT native_impl)!')
 
     return output
 
@@ -676,19 +643,22 @@ class PacConv2d(_PacConvNd):
 
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, bias=True,
                  kernel_type='gaussian', smooth_kernel_type='none', normalize_kernel=False, shared_filters=False,
-                 filler='uniform', native_impl=False):
+                 filler='uniform', native_impl=False, if_deform=False):
         kernel_size = _pair(kernel_size)
         stride = _pair(stride)
         padding = _pair(padding)
         dilation = _pair(dilation)
+        self.if_deform = if_deform
         super(PacConv2d, self).__init__(
             in_channels, out_channels, kernel_size, stride,
             padding, dilation, False, _pair(0), bias,
             False, kernel_type, smooth_kernel_type, False, normalize_kernel, shared_filters, filler)
 
         self.native_impl = native_impl
+        if if_deform and self.native_impl:
+            raise (RuntimeError("if_deform and native_impl cannot be True at the same time! This will cause wrong grads for input and offsets because the native impl uses deform_im2col func that does not auto-grrad!"))
 
-    def compute_kernel(self, input_for_kernel, input_mask=None):
+    def compute_kernel(self, input_for_kernel, input_mask=None, offsets=None):
         return packernel2d(input_for_kernel, input_mask,
                            kernel_size=self.kernel_size, stride=self.stride, padding=self.padding,
                            dilation=self.dilation, kernel_type=self.kernel_type,
@@ -697,69 +667,24 @@ class PacConv2d(_PacConvNd):
                            inv_alpha=self.inv_alpha if hasattr(self, 'inv_alpha') else None,
                            inv_lambda=self.inv_lambda if hasattr(self, 'inv_lambda') else None,
                            channel_wise=False, normalize_kernel=self.normalize_kernel, transposed=False,
-                           native_impl=self.native_impl)
+                           native_impl=self.native_impl, 
+                           offsets=offsets)
 
-    def forward(self, input_2d, input_for_kernel, kernel=None, mask=None):
+    def forward(self, input_2d, input_for_kernel, kernel=None, mask=None, offsets=None):
+        if self.if_deform:
+            assert offsets is not None, 'offsets should not be None when if_deform == True!'
+        else:
+            assert offsets is None, 'offsets should be None when if_deform == False!'
+
         output_mask = None
         if kernel is None:
-            kernel, output_mask = self.compute_kernel(input_for_kernel, mask)
+            kernel, output_mask = self.compute_kernel(input_for_kernel, mask, offsets=offsets)
             # print(input_2d.shape, input_for_kernel.shape, kernel.shape) # torch.Size([2, 128, 240, 320]) torch.Size([2, 64, 240, 320]) torch.Size([2, 1, 3, 3, 240, 320])
 
         output = pacconv2d(input_2d, kernel, self.weight, self.bias, self.stride, self.padding, self.dilation,
-                           self.shared_filters, self.native_impl)
+                           self.shared_filters, self.native_impl, offsets=offsets)
 
         return (output, kernel) if output_mask is None else (output, kernel, output_mask)
-
-
-class PacConvTranspose2d(_PacConvNd):
-    r"""
-    Args (in addition to those of ConvTranspose2d):
-        kernel_type (str): 'gaussian' | 'inv_{alpha}_{lambda}[_asym][_fixed]'. Default: 'gaussian'
-        smooth_kernel_type (str): 'none' | 'gaussian' | 'average_{sz}' | 'full_{sz}'. Default: 'none'
-        normalize_kernel (bool): Default: False
-        shared_filters (bool): Default: False
-        filler (str): 'uniform' | 'linear'. Default: 'uniform'
-
-    Note:
-        - kernel_size only accepts odd numbers
-        - padding should not be larger than :math:`dilation * (kernel_size - 1) / 2`
-    """
-
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, output_padding=0, dilation=1,
-                 bias=True, kernel_type='gaussian', smooth_kernel_type='none', normalize_kernel=False,
-                 shared_filters=False, filler='uniform', native_impl=False):
-        kernel_size = _pair(kernel_size)
-        stride = _pair(stride)
-        padding = _pair(padding)
-        output_padding = _pair(output_padding)
-        dilation = _pair(dilation)
-        super(PacConvTranspose2d, self).__init__(
-            in_channels, out_channels, kernel_size, stride,
-            padding, dilation, True, output_padding, bias,
-            False, kernel_type, smooth_kernel_type, False, normalize_kernel, shared_filters, filler)
-
-        self.native_impl = native_impl
-
-    def compute_kernel(self, input_for_kernel, input_mask=None):
-        return packernel2d(input_for_kernel, input_mask,
-                           kernel_size=self.kernel_size, stride=self.stride, padding=self.padding,
-                           output_padding=self.output_padding, dilation=self.dilation, kernel_type=self.kernel_type,
-                           smooth_kernel_type=self.smooth_kernel_type,
-                           smooth_kernel=self.smooth_kernel if hasattr(self, 'smooth_kernel') else None,
-                           inv_alpha=self.inv_alpha if hasattr(self, 'inv_alpha') else None,
-                           inv_lambda=self.inv_lambda if hasattr(self, 'inv_lambda') else None,
-                           channel_wise=False, normalize_kernel=self.normalize_kernel, transposed=True,
-                           native_impl=self.native_impl)
-
-    def forward(self, input_2d, input_for_kernel, kernel=None, mask=None):
-        output_mask = None
-        if kernel is None:
-            kernel, output_mask = self.compute_kernel(input_for_kernel, mask)
-
-        output = pacconv_transpose2d(input_2d, kernel, self.weight, self.bias, self.stride, self.padding,
-                                     self.output_padding, self.dilation, self.shared_filters, self.native_impl)
-
-        return output if output_mask is None else (output, output_mask)
 
 
 class PacPool2d(_PacConvNd):
@@ -779,11 +704,13 @@ class PacPool2d(_PacConvNd):
 
     def __init__(self, kernel_size, stride=1, padding=0, dilation=1,
                  kernel_type='gaussian', smooth_kernel_type='none',
-                 channel_wise=False, normalize_kernel=False, out_channels=-1, native_impl=False):
+                 channel_wise=False, normalize_kernel=False, out_channels=-1, native_impl=False, 
+                 if_deform=False):
         kernel_size = _pair(kernel_size)
         stride = _pair(stride)
         padding = _pair(padding)
         dilation = _pair(dilation)
+        self.if_deform = if_deform
         super(PacPool2d, self).__init__(
             -1, out_channels, kernel_size, stride,
             padding, dilation, False, _pair(0), False,
@@ -791,7 +718,7 @@ class PacPool2d(_PacConvNd):
 
         self.native_impl = native_impl
 
-    def compute_kernel(self, input_for_kernel, input_mask=None):
+    def compute_kernel(self, input_for_kernel, input_mask=None, offsets=None):
         return packernel2d(input_for_kernel, input_mask,
                            kernel_size=self.kernel_size, stride=self.stride, padding=self.padding,
                            dilation=self.dilation, kernel_type=self.kernel_type,
@@ -800,12 +727,18 @@ class PacPool2d(_PacConvNd):
                            inv_alpha=self.inv_alpha if hasattr(self, 'inv_alpha') else None,
                            inv_lambda=self.inv_lambda if hasattr(self, 'inv_lambda') else None,
                            channel_wise=self.channel_wise, normalize_kernel=self.normalize_kernel, transposed=False,
-                           native_impl=self.native_impl)
+                           native_impl=self.native_impl, 
+                           offsets=offsets)
 
-    def forward(self, input_2d, input_for_kernel, kernel=None, mask=None):
+    def forward(self, input_2d, input_for_kernel, kernel=None, mask=None, offsets=None):
+        if self.if_deform:
+            assert offsets is not None, 'offsets should not be None when if_deform == True!'
+        else:
+            assert offsets is None, 'offsets should be None when if_deform == False!'
+        
         output_mask = None
         if kernel is None:
-            kernel, output_mask = self.compute_kernel(input_for_kernel, mask)
+            kernel, output_mask = self.compute_kernel(input_for_kernel, mask, offsets=offsets)
             # print(kernel.shape, '-----kernel')
 
         bs, in_ch, in_h, in_w = input_2d.shape
@@ -814,6 +747,6 @@ class PacPool2d(_PacConvNd):
         assert self.out_channels <= 0 or self.out_channels == in_ch
 
         output = pacpool2d(input_2d, kernel, self.kernel_size, self.stride, self.padding, self.dilation,
-                           self.native_impl)
+                           self.native_impl, offsets=offsets)
 
         return (output, kernel) if output_mask is None else (output, kernel, output_mask)
